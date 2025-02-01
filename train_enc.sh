@@ -1,1 +1,0 @@
-nnUNetv2_train  Dataset702_InHouseOCTA 2d all -tr nnUNetTrainerUViLEnc -lr 5e-3 -bs 1
