@@ -38,7 +38,7 @@ class ISIC2018Dataset(Dataset):
         self.target_postfix = "_segmentation"
         self.target_fex = "png"
         self.input_fex = "jpg"
-        self.data_dir = data_dir if data_dir else "/path/to/datasets/ISIC2018"
+        self.data_dir = data_dir if data_dir else "/home/khodape/Desktop/Datasets/ISIC2018"
         self.imgs_dir = os.path.join(self.data_dir, "ISIC2018_Task1-2_Training_Input")
         self.msks_dir = os.path.join(self.data_dir, "ISIC2018_Task1_Training_GroundTruth")
         
@@ -85,7 +85,7 @@ class ISIC2018Dataset(Dataset):
 class ISIC2018DatasetFast(Dataset):
     def __init__(self, mode, data_dir=None, one_hot=True, img_transform=None, msk_transform=None):
         # pre-set variables
-        self.data_dir = data_dir if data_dir else "/path/to/datasets/ISIC2018/np"
+        self.data_dir = data_dir if data_dir else "/home/khodape/Desktop/Datasets/ISIC2018/np"
         
         # input parameters
         self.one_hot = one_hot
@@ -131,7 +131,7 @@ class ISIC2018TrainingDataset(Dataset):
         self.target_postfix = "_segmentation"
         self.target_fex = "png"
         self.input_fex = "jpg"
-        self.data_dir = data_dir if data_dir else "/path/to/datasets/ISIC2018"
+        self.data_dir = data_dir if data_dir else "/home/khodape/Desktop/Datasets/ISIC2018"
         self.imgs_dir = os.path.join(self.data_dir, "ISIC2018_Task1-2_Training_Input")
         self.msks_dir = os.path.join(self.data_dir, "ISIC2018_Task1_Training_GroundTruth")
         
@@ -179,7 +179,7 @@ class ISIC2018ValidationDataset(Dataset):
         self.target_postfix = "_segmentation"
         self.target_fex = "png"
         self.input_fex = "jpg"
-        self.data_dir = data_dir if data_dir else "/path/to/datasets/ISIC2018"
+        self.data_dir = data_dir if data_dir else "/home/khodape/Desktop/Datasets/ISIC2018"
         self.imgs_dir = os.path.join(self.data_dir, "ISIC2018_Task1-2_Validation_Input")
         self.msks_dir = os.path.join(self.data_dir, "ISIC2018_Task1_Validation_GroundTruth")
         
