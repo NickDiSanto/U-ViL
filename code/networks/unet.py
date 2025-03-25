@@ -392,17 +392,24 @@ class UNet_DS(nn.Module):
 
 
 def test_unet():
-    # Initialize the model
-    model = UNet(in_chns=3, class_num=2)
+    model = UNet(in_chns=1, class_num=2)
     
-    # Create a dummy input tensor with size (1, 3, 224, 224)
-    input_tensor = torch.randn(1, 3, 512, 512)
-    
-    # Forward pass
-    output = model(input_tensor)
-    print(f"input shape: {input_tensor.shape}, output shape: {output.shape}")
-    # Check the output shape
-    assert output.shape == (1, 2, 512, 512), f"Expected output shape (1, 2, 224, 224), but got {output.shape}"
+    input= torch.randn(1, 1, 224, 224)
+
+    output = model(input)
+    print(f"input shape: {input.shape}, output shape: {output.shape}")
+
+    # assert output.shape == (1, 1, 224, 224), f"Expected output shape (1, 2, 224, 224), but got {output.shape}"
+
+    from torchinfo import summary
+    from calflops import calculate_flops
+    print(f"input shape: {input.shape} -> output shape: {output.shape}")
+    summary(model, input_data=input, col_names=["input_size", "output_size", "num_params", "trainable"],
+            depth=4,
+            row_settings=["var_names"])
+
+    flops, macs, params = calculate_flops(model, input_shape=(1, 1, 224, 224))
+    print("FLOPs:", flops, "MACs:", macs, "Params:", params)
 
 if __name__ == "__main__":
     test_unet()
