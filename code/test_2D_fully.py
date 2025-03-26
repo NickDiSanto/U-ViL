@@ -47,9 +47,12 @@ def test_single_volume(case, net, test_save_path, FLAGS):
     for ind in range(image.shape[0]):
         slice = image[ind, :, :]
         x, y = slice.shape[0], slice.shape[1]
-        slice = zoom(slice, (256 / x, 256 / y), order=0)
+        slice = zoom(slice, (224/ x, 224 / y), order=0)
         input = torch.from_numpy(slice).unsqueeze(
             0).unsqueeze(0).float().cuda()
+        
+        # print(f"input shape: {input.shape}")
+        
         net.eval()
         with torch.no_grad():
             if FLAGS.model == "unet_urds":
@@ -63,7 +66,7 @@ def test_single_volume(case, net, test_save_path, FLAGS):
 
 
             out = out.cpu().detach().numpy()
-            pred = zoom(out, (x / 256, y / 256), order=0)
+            pred = zoom(out, (x / 224, y / 224), order=0)
             prediction[ind] = pred
 
     first_metric = calculate_metric_percase(prediction == 1, label == 1)
@@ -124,3 +127,4 @@ if __name__ == "__main__":
     metric = Inference(FLAGS)
     print(metric)
     print((metric[0]+metric[1]+metric[2])/3)
+    
