@@ -31,11 +31,11 @@ parser.add_argument("--labeled_num", type=int, default=140,
 def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
-    # dice = metric.binary.dc(pred, gt)
-    asd = metric.binary.asd(pred, gt)
+    dice = metric.binary.dc(pred, gt)
+    # asd = metric.binary.asd(pred, gt)
     # hd95 = metric.binary.hd95(pred, gt)
-    # return dice, 
-    return asd
+    return dice
+    # return asd
     # return hd95
 
 
@@ -101,6 +101,7 @@ def Inference(FLAGS):
     os.makedirs(test_save_path)
     net = net_factory(net_type=FLAGS.model, in_chns=1,
                       class_num=FLAGS.num_classes)
+    print(FLAGS.model)
     save_mode_path = os.path.join(
         snapshot_path, "{}_best_model.pth".format(FLAGS.model))
     print(save_mode_path)
