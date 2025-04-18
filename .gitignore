@@ -14,3 +14,6 @@ venv/
 results/
 code/results/
 code/results_11/
+
+.idea/
+.vscode/
