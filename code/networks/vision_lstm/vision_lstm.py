@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .vision_lstm_util import interpolate_sincos, to_ntuple, VitPatchEmbed, VitPosEmbed2d, DropPath
+from .vision_lstm_util import interpolate_sincos, to_ntuple, VitPatchEmbed, VitPosEmbed2d, DropPath, SequenceConv2d
 
 
 class SequenceTraversal(Enum):
@@ -289,14 +289,14 @@ class MultiHeadLayerNorm(LayerNorm):
 
 
 class MatrixLSTMCell(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, norm_bias=True):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
 
         self.igate = nn.Linear(3 * dim, num_heads)
         self.fgate = nn.Linear(3 * dim, num_heads)
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=False)
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
         self.causal_mask_cache = {}
         self.reset_parameters()
 
@@ -356,9 +356,14 @@ class ViLLayer(nn.Module):
             direction,
             expansion=2,
             qkv_block_size=4,
-            proj_bias=False,
+            proj_bias=True,
+            norm_bias=True,
             conv_bias=True,
-            kernel_size=4,
+            conv_kernel_size=4,
+            conv_kind="2d",
+            init_weights="original",
+            seqlens=None,
+            num_blocks=None,
     ):
         super().__init__()
         assert dim % qkv_block_size == 0
@@ -368,7 +373,10 @@ class ViLLayer(nn.Module):
         self.qkv_block_size = qkv_block_size
         self.proj_bias = proj_bias
         self.conv_bias = conv_bias
-        self.kernel_size = kernel_size
+        self.conv_kernel_size = conv_kernel_size
+        self.conv_kind = conv_kind
+        self.init_weights = init_weights
+        self.num_blocks = num_blocks
 
         inner_dim = expansion * dim
         num_heads = inner_dim // qkv_block_size
@@ -393,14 +401,30 @@ class ViLLayer(nn.Module):
             bias=proj_bias,
         )
 
-        self.conv1d = CausalConv1d(
-            dim=inner_dim,
-            kernel_size=kernel_size,
-            bias=conv_bias,
-        )
+        if conv_kind == "causal1d":
+            self.conv = CausalConv1d(
+                dim=inner_dim,
+                kernel_size=conv_kernel_size,
+                bias=conv_bias,
+            )
+        elif conv_kind == "2d":
+            assert conv_kernel_size % 2 == 1, \
+                f"same output shape as input shape is required -> even kernel sizes not supported"
+            self.conv = SequenceConv2d(
+                in_channels=inner_dim,
+                out_channels=inner_dim,
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2,
+                groups=inner_dim,
+                bias=conv_bias,
+                seqlens=seqlens,
+            )
+        else:
+            raise NotImplementedError
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=qkv_block_size,
+            norm_bias=norm_bias,
         )
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
 
@@ -427,7 +451,7 @@ class ViLLayer(nn.Module):
         x_mlstm, z = torch.chunk(x_inner, chunks=2, dim=-1)
 
         # mlstm branch
-        x_mlstm_conv = self.conv1d(x_mlstm)
+        x_mlstm_conv = self.conv(x_mlstm)
         x_mlstm_conv_act = F.silu(x_mlstm_conv)
         q = self.q_proj(x_mlstm_conv_act)
         k = self.k_proj(x_mlstm_conv_act)
@@ -457,7 +481,12 @@ class ViLLayer(nn.Module):
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
         # init outproj (original mLSTM uses num_blocks=1)
-        wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+        if self.init_weights == "original":
+            wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+        elif self.init_weights == "original-fixed":
+            wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=self.num_blocks)
+        else:
+            raise NotImplementedError
         if self.proj_down.bias is not None:
             nn.init.zeros_(self.proj_down.bias)
 
@@ -477,16 +506,40 @@ class ViLLayer(nn.Module):
 
 
 class ViLBlock(nn.Module):
-    def __init__(self, dim, direction, drop_path=0.0, norm_bias=False):
+    def __init__(
+            self,
+            dim,
+            direction,
+            drop_path=0.0,
+            conv_kind="2d",
+            conv_kernel_size=3,
+            proj_bias=True,
+            norm_bias=True,
+            seqlens=None,
+            num_blocks=None,
+            init_weights="original",
+    ):
         super().__init__()
         self.dim = dim
         self.direction = direction
         self.drop_path = drop_path
-        self.norm_bias = norm_bias
+        self.conv_kind = conv_kind
+        self.conv_kernel_size = conv_kernel_size
+        self.init_weights = init_weights
 
         self.drop_path = DropPath(drop_prob=drop_path)
         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias)
-        self.layer = ViLLayer(dim=dim, direction=direction)
+        self.layer = ViLLayer(
+            dim=dim,
+            direction=direction,
+            conv_kind=conv_kind,
+            conv_kernel_size=conv_kernel_size,
+            seqlens=seqlens,
+            norm_bias=norm_bias,
+            proj_bias=proj_bias,
+            num_blocks=num_blocks,
+            init_weights=init_weights,
+        )
 
         self.reset_parameters()
 
@@ -504,29 +557,78 @@ class ViLBlock(nn.Module):
         self.norm.reset_parameters()
 
 
+class ViLBlockPair(nn.Module):
+    def __init__(
+            self,
+            dim,
+            drop_path=0.0,
+            conv_kind="2d",
+            conv_kernel_size=3,
+            proj_bias=True,
+            norm_bias=True,
+            seqlens=None,
+            num_blocks=None,
+            init_weights="original",
+    ):
+        super().__init__()
+        self.rowwise_from_top_left = ViLBlock(
+            dim=dim,
+            direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
+            drop_path=drop_path,
+            conv_kind=conv_kind,
+            conv_kernel_size=conv_kernel_size,
+            proj_bias=proj_bias,
+            norm_bias=norm_bias,
+            seqlens=seqlens,
+            num_blocks=num_blocks,
+            init_weights=init_weights,
+        )
+        self.rowwise_from_bot_right = ViLBlock(
+            dim=dim,
+            direction=SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,
+            drop_path=drop_path,
+            conv_kind=conv_kind,
+            conv_kernel_size=conv_kernel_size,
+            proj_bias=proj_bias,
+            norm_bias=norm_bias,
+            seqlens=seqlens,
+            num_blocks=num_blocks,
+            init_weights=init_weights,
+        )
+
+    def forward(self, x):
+        x = self.rowwise_from_top_left(x)
+        x = self.rowwise_from_bot_right(x)
+        return x
+
+
 class VisionLSTM(nn.Module):
     def __init__(
             self,
             dim=192,
             input_shape=(3, 224, 224),
             patch_size=16,
-            depth=24,
+            depth=12,
             output_shape=(1000,),
             mode="classifier",
-            pooling="bilateral_avg",
+            pooling="bilateral_flatten",
             drop_path_rate=0.0,
-            stride=None,
-            alternation="bidirectional",
             drop_path_decay=False,
+            stride=None,
             legacy_norm=False,
+            conv_kind="2d",
+            conv_kernel_size=3,
+            proj_bias=True,
+            norm_bias=True,
+            init_weights="original",
     ):
+        if depth == 24 and dim < 1024:
+            warnings.warn(
+                "A single VisionLSTM block consists of two subblocks (one for each traversal direction). "
+                "ViL-T, ViL-S and ViL-B therefore use depth=12 instead of depth=24, are you sure you want to use "
+                "depth=24?"
+            )
         super().__init__()
-        warnings.warn(
-            "You are using an old version of VisionLSTM that uses (i) bilateral_avg pooling instead of "
-            "bilateral_concat (ii) causal conv1d instead of conv2d before q and k (iii) no biases in projection "
-            "and layernorms. These three changes improve ImageNet-1K accuracy of a ViL-T from 77.3% to 78.1%. "
-            "We recommend to use VisionLSTM2 instead of VisionLSTM."
-        )
         self.input_shape = input_shape
         self.output_shape = output_shape
         ndim = len(self.input_shape) - 1
@@ -536,9 +638,13 @@ class VisionLSTM(nn.Module):
         self.stride = stride
         self.mode = mode
         self.pooling = pooling
-        self.alternation = alternation
         self.drop_path_rate = drop_path_rate
         self.drop_path_decay = drop_path_decay
+        self.conv_kind = conv_kind
+        self.conv_kernel_size = conv_kernel_size
+        self.proj_bias = proj_bias
+        self.norm_bias = norm_bias
+        self.init_weights = init_weights
 
         # initialize patch_embed
         self.patch_embed = VitPatchEmbed(
@@ -558,47 +664,51 @@ class VisionLSTM(nn.Module):
         else:
             dpr = [drop_path_rate] * depth
 
-        # directions
-        directions = []
-        if alternation == "bidirectional":
-            for i in range(depth):
-                if i % 2 == 0:
-                    directions.append(SequenceTraversal.ROWWISE_FROM_TOP_LEFT)
-                else:
-                    directions.append(SequenceTraversal.ROWWISE_FROM_BOT_RIGHT)
-        else:
-            raise NotImplementedError(f"invalid alternation '{alternation}'")
-
-        # blocks
+        # merge two blocks into a blockpair to keep depth equal to the depth of transformers
+        # useful to keep layer-wise lr decay implementations consistent with transformers
         self.blocks = nn.ModuleList(
             [
-                ViLBlock(
+                ViLBlockPair(
                     dim=dim,
                     drop_path=dpr[i],
-                    direction=directions[i],
+                    conv_kind=conv_kind,
+                    seqlens=self.patch_embed.seqlens,
+                    proj_bias=proj_bias,
+                    norm_bias=norm_bias,
+                    num_blocks=depth * 2,
+                    init_weights=init_weights,
                 )
                 for i in range(depth)
-            ]
+            ],
         )
-        # LEGACY: only norm after pooling is needed, norm after blocks is not needed but was used for training
+        if pooling == "bilateral_flatten" and mode == "classifier":
+            head_dim = dim * 2
+        else:
+            head_dim = dim
+        self.norm = LayerNorm(dim, bias=norm_bias, eps=1e-6)
+        # LEGACY: not needed but was used during training
         if legacy_norm:
-            self.legacy_norm = LayerNorm(dim, bias=False)
+            self.legacy_norm = nn.LayerNorm(head_dim)
         else:
             self.legacy_norm = nn.Identity()
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
 
         # head
-        if mode is None:
-            # no head -> use as feature extractor
-            assert self.output_shape is None
-            assert self.pooling is None
+        if mode == "features":
+            if self.output_shape is not None:
+                warnings.warn(f"passed mode=features -> output_shape is ignored ({self.output_shape})")
             self.head = None
-            self.output_shape = (self.patch_embed.num_patches, dim)
+            if self.pooling is None:
+                self.output_shape = (self.patch_embed.num_patches, dim)
+            elif self.pooling == "to_image":
+                self.output_shape = (dim, *self.patch_embed.seqlens)
+            else:
+                warnings.warn(f"passed invalid pooling -> pooling is ignored ({self.pooling})")
+                self.pooling = None
         elif mode == "classifier":
             # linear classification head
             assert self.output_shape is not None and len(self.output_shape) == 1, \
                 f"define number of classes via output_shape=(num_classes,) (e.g. output_shape=(1000,) for ImageNet-1K"
-            self.head = nn.Linear(dim, self.output_shape[0])
+            self.head = nn.Linear(head_dim, self.output_shape[0])
             # following MAE https://github.com/facebookresearch/mae/blob/main/main_finetune.py#L257
             nn.init.trunc_normal_(self.head.weight, std=2e-5)
             nn.init.zeros_(self.head.bias)
@@ -610,6 +720,14 @@ class VisionLSTM(nn.Module):
         old_pos_embed = state_dict["pos_embed.embed"]
         if old_pos_embed.shape != self.pos_embed.embed.shape:
             state_dict["pos_embed.embed"] = interpolate_sincos(embed=old_pos_embed, seqlens=self.pos_embed.seqlens)
+        # remove head and adapt layernorm for feature extraction
+        if self.mode == "features":
+            state_dict.pop("head.weight", None)
+            state_dict.pop("head.bias", None)
+            # legacy_norm uses head dim (is doubled for bilateral_concat) -> not usable for feature extraction
+            cur_sd = self.state_dict()
+            state_dict["legacy_norm.weight"] = cur_sd["legacy_norm.weight"]
+            state_dict["legacy_norm.bias"] = cur_sd["legacy_norm.bias"]
         return super().load_state_dict(state_dict=state_dict, strict=strict)
 
     @torch.jit.ignore
@@ -619,8 +737,10 @@ class VisionLSTM(nn.Module):
     def forward(self, x):
         # embed patches
         x = self.patch_embed(x)
+        print(f"patch_embed output: {x.shape}")
         # add pos_embed
         x = self.pos_embed(x)
+        print(f"pos_embed output: {x.shape}")
 
         # flatten to 1d
         x = einops.rearrange(x, "b ... d -> b (...) d")
@@ -628,15 +748,28 @@ class VisionLSTM(nn.Module):
         # apply blocks
         for block in self.blocks:
             x = block(x)
-        x = self.legacy_norm(x)
+        x = self.norm(x)
 
         # pool
         if self.pooling is None:
-            x = self.norm(x)
+            x = self.legacy_norm(x)
+        elif self.pooling == "to_image":
+            x = self.legacy_norm(x)
+            seqlen_h, seqlen_w = self.patch_embed.seqlens
+            x = einops.rearrange(
+                x,
+                "b (seqlen_h seqlen_w) dim -> b dim seqlen_h seqlen_w",
+                seqlen_h=seqlen_h,
+                seqlen_w=seqlen_w,
+            )
         elif self.pooling == "bilateral_avg":
             # norm after pooling
             x = (x[:, 0] + x[:, -1]) / 2
-            x = self.norm(x)
+            x = self.legacy_norm(x)
+        elif self.pooling == "bilateral_flatten":
+            # norm after pooling
+            x = torch.concat([x[:, 0], x[:, -1]], dim=1)
+            x = self.legacy_norm(x)
         else:
             raise NotImplementedError(f"pooling '{self.pooling}' is not implemented")
 

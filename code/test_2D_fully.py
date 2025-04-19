@@ -3,7 +3,6 @@ import os
 import shutil
 
 import h5py
-import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
 import torch

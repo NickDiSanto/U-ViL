@@ -1,83 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.modules.module import T
-# from xlstmutils import PatchEmbed, VitPatchEmbed, VitPosEmbed2d, PatchMerging, PatchExpand, FinalPatchExpand_X4
-try :
-    from vision_lstm.vision_lstm2 import *
-except:
-    from .vision_lstm.vision_lstm2 import *
-from timm.layers import drop_path, DropPath, to_2tuple, trunc_normal_, to_ntuple
+from vision_lstm.vision_lstm import *
+from vision_lstm.vision_lstm_util import interpolate_sincos
+from timm.layers import to_ntuple
 import einops
-import warnings
 
 import numpy as np
-import torch.utils.checkpoint as checkpoint
 from einops import rearrange
-from timm.layers import DropPath, to_2tuple, trunc_normal_, to_ntuple
+from timm.layers import to_ntuple
 
 from torchinfo import summary
 from calflops import calculate_flops
 
-
-# from kappamodules.functional.pos_embed import interpolate_sincos
-def interpolate_sincos(embed, seqlens, mode="bicubic"):
-    assert embed.ndim - 2 == len(seqlens)
-    embed = F.interpolate(
-        einops.rearrange(embed, "1 ... dim -> 1 dim ..."),
-        size=seqlens,
-        mode=mode,
-    )
-    embed = einops.rearrange(embed, "1 dim ... -> 1 ... dim")
-    return embed
-
-
-class PatchMergingv2(nn.Module):
-    r""" Patch Merging Layer for 2D (generalization to 3D is analogous).
-
-    This layer reshapes a flat patch sequence (B, L, C) into (B, H, W, C)
-    where (H, W) = input_resolution, then partitions each spatial axis into blocks
-    of 2 (i.e. merging 4 patches), concatenates along the channel dimension, applies
-    normalization, and a linear reduction mapping the concatenated channels to (2 * C).
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input grid, e.g. (H, W).
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm.
-    """
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution  # e.g. (H, W)
-        self.dim = dim
-        self.ndim = len(input_resolution)
-        # For 2D, merging 2x2 patches means 4 patches merged.
-        self.num_patches_merged = 2 ** self.ndim  # 4 for 2D, 8 for 3D
-        # Reduction maps (merged_channels = num_patches_merged * dim) --> (2 * dim)
-        self.reduction = nn.Linear(self.num_patches_merged * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(self.num_patches_merged * dim)
-
-    def forward(self, x):
-        B, L, C = x.shape
-        expected_L = int(np.prod(self.input_resolution))
-        assert L == expected_L, f"input feature has wrong size: got {L}, expected {expected_L}"
-        # new spatial resolution after merging: each dimension halved
-        new_res = [r // 2 for r in self.input_resolution]  # e.g. [28, 28] for 56x56
-        # Reshape from (B, L, C) to (B, H, W, C)
-        x = x.view(B, *self.input_resolution, C)
-        # Rearrange into an intermediate shape: (B, r0, 2, r1, 2, C)
-        # Here r0 = new_res[0], r1 = new_res[1]
-        x = einops.rearrange(
-            x,
-            "b (r0 2) (r1 2) c -> b r0 2 r1 2 c",
-            r0=new_res[0], r1=new_res[1]
-        )
-        # Merge the two constant axes with the channel axis: (B, r0, r1, 2*2*C)
-        x = x.reshape(B, new_res[0], new_res[1], 4 * C)
-        # Flatten spatial dimensions: (B, r0, r1, 4*C) -> (B, r0*r1, 4*C)
-        x = x.reshape(B, -1, 4 * C)
-        x = self.norm(x)
-        x = self.reduction(x)
-        return x
 
 
 class PatchMerging(nn.Module):
@@ -175,54 +110,6 @@ class FinalPatchExpand_X4(nn.Module):
         return x
 
 
-class PatchEmbed(nn.Module):
-    r""" Image to Patch Embedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B Ph*Pw C
-        if self.norm is not None:
-            x = self.norm(x)
-        return x
-
-    def flops(self):
-        Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
-
-
 class VitPatchEmbed(nn.Module):
     def __init__(self, dim, num_channels, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
         super().__init__()
@@ -312,80 +199,6 @@ class VitPosEmbed2d(nn.Module):
             embed = self.embed
         return x + embed
     
-
-
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-
-from termcolor import colored
-def _print(string, p=None):
-    if not p:
-        print(string)
-        return
-    pre = f"{bcolors.ENDC}"
-  
-    if "bold" in p.lower():
-        pre += bcolors.BOLD
-    elif "underline" in p.lower():
-        pre += bcolors.UNDERLINE
-    elif "header" in p.lower():
-        pre += bcolors.HEADER
-      
-    if "warning" in p.lower():
-        pre += bcolors.WARNING
-    elif "error" in p.lower():
-        pre += bcolors.FAIL
-    elif "ok" in p.lower():
-        pre += bcolors.OKGREEN
-    elif "info" in p.lower():
-        if "blue" in p.lower():
-            pre += bcolors.OKBLUE
-        else: 
-            pre += bcolors.OKCYAN
-
-    print(f"{pre}{string}{bcolors.ENDC}")
-
-
-
-import yaml
-def load_config(config_filepath):
-    try:
-        with open(config_filepath, 'r') as file:
-            config = yaml.safe_load(file)
-            return config
-    except FileNotFoundError:
-        _print(f"Config file not found! <{config_filepath}>", "error_bold")
-        exit(1)
-    
-
-    
-import numpy as np
-from matplotlib import pyplot as plt
-def show_sbs(im1, im2, figsize=[8,4], im1_title="Image", im2_title="Mask", show=True):
-    if im1.shape[0]<4:
-        im1 = np.array(im1)
-        im1 = np.transpose(im1, [1, 2, 0])
-        
-    if im2.shape[0]<4: 
-        im2 = np.array(im2)
-        im2 = np.transpose(im2, [1, 2, 0])
-        
-    _, axs = plt.subplots(1, 2, figsize=figsize)
-    axs[0].imshow(im1)
-    axs[0].set_title(im1_title)
-    axs[1].imshow(im2, cmap='gray')
-    axs[1].set_title(im2_title)
-    if show: plt.show()
-
 
 class MyViLBlockEnc(nn.Module):
     """ A basic Vision xLSTM layer for one stage in encoder.
@@ -670,3 +483,4 @@ if __name__ == "__main__":
 
     flops, macs, params = calculate_flops(model, input_shape=(1, 1, 224, 224))
     print("FLOPs:", flops, "MACs:", macs, "Params:", params)
+    

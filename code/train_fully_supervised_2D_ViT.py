@@ -2,9 +2,7 @@ import argparse
 import logging
 import os
 import random
-import shutil
 import sys
-import time
 
 import numpy as np
 import torch
@@ -13,31 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter
-from torch.nn import BCEWithLogitsLoss
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.utils import make_grid
 from tqdm import tqdm
 
 from config import get_config
 
-
-import h5py
-import nibabel as nib
-import SimpleITK as sitk
-import torch
-from medpy import metric
-from scipy.ndimage import zoom
-from scipy.ndimage.interpolation import zoom
-
-from dataloaders import utils
 from dataloaders.dataset import BaseDataSets, RandomGenerator, BaseDataSets_Synapse
-from networks.net_factory import net_factory
 from networks.vision_transformer import SwinUnet as ViT_seg
-# from networks.vision_mamba import MambaUnet as VIM
-from utils import losses, metrics, ramps
-from val_2D_ViT import test_single_volume, test_single_volume_ds
+from val_2D_ViT import test_single_volume
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -54,25 +37,20 @@ parser.add_argument('--deterministic', type=int,  default=1,
                     help='whether use deterministic training')
 parser.add_argument('--base_lr', type=float,  default=0.01,
                     help='segmentation network learning rate')
-parser.add_argument('--patch_size', type=list,  default=[224, 224],
-                    help='patch size of network input')
-parser.add_argument('--seed', type=int,  default=1337, help='random seed')
-parser.add_argument('--num_classes', type=int,  default=4,
-                    help='output channel of network')
-parser.add_argument(
-    '--cfg', type=str, default="../code/configs/swin_tiny_patch4_window7_224_lite.yaml", help='path to config file', )
-parser.add_argument(
-    "--opts",
-    help="Modify config options by adding 'KEY VALUE' pairs. ",
-    default=None,
-    nargs='+',
-)
+parser.add_argument('--patch_size', type=list,
+                    default=[224, 224], help='patch size of network input')
+parser.add_argument('--seed', type=int, 
+                    default=1337, help='random seed')
+parser.add_argument('--num_classes', type=int,
+                    default=4, help='output channel of network')
+parser.add_argument('--cfg', type=str,
+                    default="../code/configs/swin_tiny_patch4_window7_224_lite.yaml", help='path to config file', )
+parser.add_argument("--opts", help="Modify config options by adding 'KEY VALUE' pairs. ",
+                    default=None, nargs='+',)
 parser.add_argument('--zip', action='store_true',
                     help='use zipped dataset instead of folder dataset')
 parser.add_argument('--cache-mode', type=str, default='part', choices=['no', 'full', 'part'],
-                    help='no: no cache, '
-                         'full: cache all data, '
-                         'part: sharding the dataset into nonoverlapping pieces and only cache one piece')
+                    help='no: no cache, full: cache all data, part: sharding the dataset into nonoverlapping pieces and only cache one piece')
 parser.add_argument('--resume', help='resume from checkpoint')
 parser.add_argument('--accumulation-steps', type=int,
                     help="gradient accumulation steps")
@@ -92,7 +70,8 @@ parser.add_argument('--labeled_bs', type=int, default=12,
 parser.add_argument('--labeled_num', type=int, default=140,
                     help='labeled data')
 # costs
-parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
+parser.add_argument('--ema_decay', type=float,
+                    default=0.99, help='ema_decay')
 parser.add_argument('--consistency_type', type=str,
                     default="mse", help='consistency_type')
 parser.add_argument('--consistency', type=float,
@@ -101,6 +80,46 @@ parser.add_argument('--consistency_rampup', type=float,
                     default=200.0, help='consistency_rampup')
 args = parser.parse_args()
 config = get_config(args)
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, n_classes):
+        super(DiceLoss, self).__init__()
+        self.n_classes = n_classes
+
+    def _one_hot_encoder(self, input_tensor):
+        tensor_list = []
+        for i in range(self.n_classes):
+            temp_prob = input_tensor == i * torch.ones_like(input_tensor)
+            tensor_list.append(temp_prob)
+        output_tensor = torch.cat(tensor_list, dim=1)
+        return output_tensor.float()
+
+    def _dice_loss(self, score, target):
+        target = target.float()
+        smooth = 1e-5
+        intersect = torch.sum(score * target)
+        y_sum = torch.sum(target * target)
+        z_sum = torch.sum(score * score)
+        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        loss = 1 - loss
+        return loss
+
+    def forward(self, inputs, target, weight=None, softmax=False):
+        if softmax:
+            inputs = torch.softmax(inputs, dim=1)
+        target = self._one_hot_encoder(target)
+        if weight is None:
+            weight = [1] * self.n_classes
+        assert inputs.size() == target.size(), 'predict & target shape do not match'
+        class_wise_dice = []
+        loss = 0.0
+        for i in range(0, self.n_classes):
+            dice = self._dice_loss(inputs[:, i], target[:, i])
+            class_wise_dice.append(1.0 - dice.item())
+            loss += dice * weight[i]
+        return loss / self.n_classes
+
 
 def patients_to_slices(dataset, patiens_num):
     ref_dict = None
@@ -144,7 +163,7 @@ def train(args, snapshot_path):
     optimizer = optim.SGD(model.parameters(), lr=base_lr,
                           momentum=0.9, weight_decay=0.0001)
     ce_loss = CrossEntropyLoss()
-    dice_loss = losses.DiceLoss(num_classes)
+    dice_loss = DiceLoss(num_classes)
 
     writer = SummaryWriter(snapshot_path + '/log')
     logging.info("{} iterations per epoch".format(len(trainloader)))
@@ -261,10 +280,6 @@ if __name__ == "__main__":
         args.exp, args.labeled_num, args.model)
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
-    # if os.path.exists(snapshot_path + '/code'):
-    #     shutil.rmtree(snapshot_path + '/code')
-    # shutil.copytree('.', snapshot_path + '/code',
-    #                 shutil.ignore_patterns(['.git', '__pycache__']))
 
     logging.basicConfig(filename=snapshot_path+"/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')

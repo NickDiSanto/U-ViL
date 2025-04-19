@@ -1,11 +1,7 @@
-# from networks.efficientunet import Effi_UNet
-from networks.enet import ENet
-from networks.pnet import PNet2D
-from networks.unet import UNet
+from networks import UNet, UViL
 import argparse
 from networks.vision_transformer import SwinUnet as ViT_seg
 from networks.config import get_config
-# from networks.nnunet import initialize_network
 
 
 parser = argparse.ArgumentParser()
@@ -83,13 +79,9 @@ def net_factory(net_type="unet", in_chns=1, class_num=4):
                  embed_dim=96,
                  patch_norm=True,
                  num_stages=4).cuda()
-    elif net_type == "enet":
-        net = ENet(in_channels=in_chns, num_classes=class_num).cuda()
     elif net_type == "swinunet":
         net = ViT_seg(config, img_size=args.patch_size,
                       num_classes=args.num_classes).cuda()
-    elif net_type == "pnet":
-        net = PNet2D(in_chns, class_num, 64, [1, 2, 4, 8, 16]).cuda()
     else:
         net = None
     return net
